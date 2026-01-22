@@ -5,121 +5,128 @@ import pandas as pd
 import datetime
 import requests
 import re
-from bs4 import BeautifulSoup
 import json
 
 app = dash.Dash(__name__)
 server = app.server 
 
-# --- INTERFAZ DE SALA DE CONTROL ---
-app.layout = html.Div(style={'backgroundColor': '#020617', 'minHeight': '100vh', 'color': 'white', 'fontFamily': 'monospace'}, children=[
-    html.Div(style={'maxWidth': '1200px', 'margin': '0 auto', 'padding': '20px'}, children=[
-        html.Div(style={'borderLeft': '4px solid #38bdf8', 'paddingLeft': '15px', 'marginBottom': '30px'}, children=[
-            html.H1("MONITOR DE DEMANDA - SIN COLOMBIA", style={'margin': '0', 'fontSize': '22px', 'letterSpacing': '2px'}),
-            html.P("EXTRACCIÓN DE ALTA RESOLUCIÓN (Sinergox RT)", style={'color': '#38bdf8', 'margin': '5px 0 0 0'})
-        ]),
+app.layout = html.Div(style={'backgroundColor': '#020617', 'minHeight': '100vh', 'color': 'white', 'fontFamily': 'sans-serif'}, children=[
+    html.Div(style={'maxWidth': '1100px', 'margin': '0 auto', 'padding': '20px'}, children=[
+        html.H2("⚡ MONITOR NACIONAL DE ENERGÍA", style={'color': '#38bdf8', 'letterSpacing': '2px'}),
+        html.Div(id='status-log', style={'fontSize': '12px', 'color': '#94a3b8', 'marginBottom': '20px'}),
         
         dcc.Loading(children=dcc.Graph(id='rt-graph', config={'displayModeBar': False})),
         
         html.Div(style={'display': 'flex', 'gap': '20px', 'marginTop': '20px'}, children=[
-            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '8px'}, children=[
-                html.P("ÚLTIMA LECTURA REAL", style={'color': '#94a3b8', 'fontSize': '12px'}),
-                html.H2(id='val-real', style={'color': '#f8fafc', 'margin': '0'})
+            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '10px'}, children=[
+                html.P("DEMANDA ACTUAL (MW)", style={'fontSize': '12px', 'color': '#94a3b8'}),
+                html.H1(id='val-real', style={'margin': '0', 'color': '#f8fafc'})
             ]),
-            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '8px'}, children=[
-                html.P("STATUS DEL SCRAPER", style={'color': '#94a3b8', 'fontSize': '12px'}),
-                html.H2(id='status-scrap', style={'fontSize': '18px', 'margin': '0'})
+            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '10px'}, children=[
+                html.P("FUENTE DE DATOS", style={'fontSize': '12px', 'color': '#94a3b8'}),
+                html.H3(id='val-fuente', style={'margin': '0', 'color': '#38bdf8'})
             ])
         ]),
-        
-        dcc.Interval(id='refresh', interval=5*60*1000, n_intervals=0)
+        dcc.Interval(id='refresh', interval=120*1000, n_intervals=0)
     ])
 ])
 
-# --- SCRAPER INTELIGENTE ---
+# --- EL MOTOR DE EXTRACCIÓN ROBUSTO ---
 
-def scrape_sinergox():
-    url = "https://sinergox.xm.com.co/dmnd/Paginas/Informes/Demanda_Tiempo_Real.aspx"
+def get_realtime_data():
+    session = requests.Session()
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Content-Type': 'application/json; charset=utf-8',
+        'Referer': 'https://sinergox.xm.com.co/dmnd/Paginas/Informes/Demanda_Tiempo_Real.aspx'
     }
-    
+
     try:
-        session = requests.Session()
-        response = session.get(url, headers=headers, timeout=25)
+        # PASO 1: Obtener cookies de sesión entrando a la página principal
+        print("Intentando obtener sesión de Sinergox...")
+        landing = session.get("https://sinergox.xm.com.co/dmnd/Paginas/Informes/Demanda_Tiempo_Real.aspx", timeout=15)
         
-        if response.status_code != 200:
-            return None, f"Error Acceso: {response.status_code}"
-
-        # Usamos BeautifulSoup para buscar los scripts
-        soup = BeautifulSoup(response.text, 'html.parser')
-        scripts = soup.find_all('script')
+        # PASO 2: Intentar el servicio WCF con la sesión activa
+        service_url = "https://sinergox.xm.com.co/dmnd/_vti_bin/XM.Sinergox.Servicios/Demanda.svc/GetDemandaRT"
+        response = session.post(service_url, headers=headers, data="{}", timeout=15)
         
-        data_json = None
-        # Buscamos el script que contiene los datos de la gráfica
-        for script in scripts:
-            if script.string and 'dataReal' in script.string:
-                # Usamos Regex para extraer el contenido de la variable dataReal
-                # Buscamos algo como: var dataReal = [...];
-                match = re.search(r'var dataReal\s*=\s*(\[.*?\]);', script.string, re.DOTALL)
-                if match:
-                    data_json = match.group(1)
-                    break
-        
-        if not data_json:
-            return None, "No se encontró la variable dataReal en el HTML"
-
-        # Limpiar y parsear el JSON extraído
-        # Los JSON de XM suelen tener fechas en formato /Date(...)/
-        raw_list = json.loads(data_json)
-        
-        records = []
-        for item in raw_list:
-            # Extraer milisegundos de "/Date(1737482400000)/"
-            ms_str = re.search(r'\((\d+)\)', item['Fecha']).group(1)
-            ts = pd.to_datetime(int(ms_str), unit='ms') - pd.Timedelta(hours=5)
-            records.append({'fecha': ts, 'valor': item['Valor']})
+        if response.status_code == 200 and "GetDemandaRTResult" in response.text:
+            data = response.json()['GetDemandaRTResult']
+            df = pd.DataFrame(data['DemandaReal'])
             
-        return pd.DataFrame(records).sort_values('fecha'), "CONECTADO"
+            def parse_date(d):
+                ms = int(re.search(r'\d+', d).group())
+                return pd.to_datetime(ms, unit='ms') - pd.Timedelta(hours=5)
+
+            df['fecha'] = df['Fecha'].apply(parse_date)
+            return df, "Sinergox (5 min)"
 
     except Exception as e:
-        return None, f"Fallo: {str(e)}"
+        print(f"Sinergox falló: {e}")
+
+    # PASO 3: FALLBACK INTELIGENTE (API de Resumen Diario - Granularidad Alta)
+    # Si Sinergox bloquea, esta es la fuente que usa la App Móvil de XM
+    try:
+        print("Cambiando a Fuente de Resumen XM...")
+        res_url = "https://servapibi.xm.com.co/hourly"
+        payload = {
+            "MetricId": "DemaReal",
+            "StartDate": str(datetime.datetime.now().date()),
+            "EndDate": str(datetime.datetime.now().date()),
+            "Entity": "Sistema"
+        }
+        res = requests.post(res_url, json=payload, timeout=10)
+        if res.status_code == 200:
+            items = res.json().get('Items', [])
+            records = []
+            for item in items:
+                f = item['Date']
+                for h in range(1, 25):
+                    v = item.get(f'Hour{str(h).zfill(2)}')
+                    if v is not None:
+                        ts = pd.to_datetime(f) + pd.to_timedelta(h-1, unit='h')
+                        records.append({'fecha': ts, 'Valor': v})
+            return pd.DataFrame(records), "XM API (Horaria)"
+    except:
+        pass
+
+    return None, "Error de Conexión"
 
 # --- CALLBACKS ---
 
 @app.callback(
-    [Output('rt-graph', 'figure'), Output('val-real', 'children'), Output('status-scrap', 'children'), Output('status-scrap', 'style')],
+    [Output('rt-graph', 'figure'), Output('val-real', 'children'), Output('val-fuente', 'children'), Output('status-log', 'children')],
     [Input('refresh', 'n_intervals')]
 )
-def update_dashboard(n):
-    df, status = scrape_sinergox()
+def update(n):
+    df, fuente = get_realtime_data()
     
     if df is None or df.empty:
-        return go.Figure(), "---", status, {'color': '#ef4444'}
+        return go.Figure(), "---", fuente, f"Último intento: {datetime.datetime.now().strftime('%H:%M:%S')} - Fallido"
 
-    v_actual = df['valor'].iloc[-1]
+    v_actual = df['Valor'].iloc[-1]
     
-    # Crear gráfica estilizada
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df['fecha'], y=df['valor'],
-        mode='lines',
+    fig = go.Figure(go.Scatter(
+        x=df['fecha'], y=df['Valor'],
+        mode='lines+markers' if len(df) < 50 else 'lines',
         line=dict(color='#38bdf8', width=3),
         fill='tozeroy',
         fillcolor='rgba(56, 189, 248, 0.05)',
-        hovertemplate='%{y:.1f} MW<br>%{x|%H:%M}<extra></extra>'
+        name='MW'
     ))
 
     fig.update_layout(
         template='plotly_dark',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=40, r=0, t=10, b=30),
-        xaxis=dict(showgrid=True, gridcolor='#1e293b', tickformat='%H:%M'),
-        yaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=False),
+        margin=dict(l=0, r=0, t=10, b=0),
+        xaxis=dict(showgrid=True, gridcolor='#1e293b'),
+        yaxis=dict(showgrid=True, gridcolor='#1e293b')
     )
 
-    return fig, f"{v_actual:,.0f} MW", f"● {status}", {'color': '#22c55e'}
+    log = f"Conexión exitosa a las {datetime.datetime.now().strftime('%H:%M:%S')}"
+    return fig, f"{v_actual:,.0f}", fuente, log
 
 if __name__ == '__main__':
     app.run_server(debug=False)
