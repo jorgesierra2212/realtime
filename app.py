@@ -101,4 +101,58 @@ def get_data(metric_id):
                 valor = item.get(col_hora)
                 if valor is not None:
                     timestamp = pd.to_datetime(fecha_base) + pd.to_timedelta(h-1, unit='h')
-                    data_list.a
+                    data_list.append({'x': timestamp, 'y': valor})
+        
+        return pd.DataFrame(data_list).sort_values('x')
+    except Exception as e:
+        print(f"Error en datos: {e}")
+        return None
+
+# --- CALLBACKS ---
+
+@app.callback(
+    [Output('metric-dropdown', 'options'), Output('metric-dropdown', 'value')],
+    Input('auto-refresh', 'n_intervals')
+)
+def update_dropdown_list(n):
+    opts = get_catalog()
+    # Intentamos poner Demanda Real (DemaReal) por defecto si existe
+    default_val = 'DemaReal' if any(o['value'] == 'DemaReal' for o in opts) else (opts[0]['value'] if opts else None)
+    return opts, default_val
+
+@app.callback(
+    [Output('main-graph', 'figure'), Output('status-badge', 'children'), Output('status-badge', 'style')],
+    [Input('metric-dropdown', 'value'), Input('auto-refresh', 'n_intervals')]
+)
+def update_main_plot(selected_metric, n):
+    if not selected_metric:
+        return go.Figure(), "Seleccione una variable", {'color': 'gray'}
+
+    df = get_data(selected_metric)
+    
+    if df is None or df.empty:
+        return go.Figure(), f"⚠️ La métrica '{selected_metric}' no tiene datos horarios disponibles para hoy.", {'color': '#d32f2f'}
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df['x'], y=df['y'],
+        mode='lines',
+        line=dict(color='#2563eb', width=3),
+        fill='tozeroy',
+        fillcolor='rgba(37, 99, 235, 0.1)',
+        name=selected_metric
+    ))
+
+    fig.update_layout(
+        template='plotly_white',
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis=dict(title="Fecha y Hora", showgrid=True),
+        yaxis=dict(title="Valor", showgrid=True),
+        hovermode="x unified"
+    )
+
+    status_text = f"● Conectado a XM: {selected_metric} ({datetime.datetime.now().strftime('%H:%M:%S')})"
+    return fig, status_text, {'color': '#2e7d32'}
+
+if __name__ == '__main__':
+    app.run_server(debug=False)
