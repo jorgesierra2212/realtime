@@ -5,51 +5,53 @@ import plotly.graph_objs as go
 import pandas as pd
 import datetime
 import requests
+import json
 
-# 1. Inicializar la App y el Servidor inmediatamente
 app = dash.Dash(__name__)
 server = app.server 
-app.title = "Demanda XM Colombia"
 
-# 2. Definir el Layout PRIMERO (para que nunca sea None)
-app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'padding': '20px', 'backgroundColor': '#f8f9fa'}, children=[
-    html.Div(style={'maxWidth': '1000px', 'margin': '0 auto', 'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '10px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)'}, children=[
-        html.H2("Demanda de Energía en Tiempo Real (SIN)", style={'textAlign': 'center', 'color': '#2c3e50'}),
-        html.P(id='live-update-text', style={'textAlign': 'center', 'color': '#7f8c8d'}, children="Cargando datos desde XM..."),
-        
-        dcc.Graph(
-            id='live-graph-demanda', 
-            config={'displayModeBar': False},
-            figure=go.Figure() # Figura vacía inicial
-        ),
-        
-        dcc.Interval(
-            id='interval-component',
-            interval=5*60*1000, # 5 minutos
-            n_intervals=0
-        )
-    ])
+app.layout = html.Div(style={'fontFamily': 'Arial', 'padding': '20px'}, children=[
+    html.H2("Monitor de Demanda XM - Diagnóstico", style={'textAlign': 'center'}),
+    html.Div(id='debug-status', style={'color': 'red', 'textAlign': 'center', 'marginBottom': '20px'}),
+    dcc.Graph(id='live-graph-demanda'),
+    dcc.Interval(id='interval-component', interval=60*1000, n_intervals=0) # Reintentar cada minuto
 ])
 
-# 3. Función robusta para traer datos (Sin librerías externas)
-def fetch_xm_data():
+def fetch_xm_data(metric="DemandaReal"):
     try:
-        hoy = datetime.datetime.now().date()
-        ayer = hoy - datetime.timedelta(days=1)
-        url = "https://servapibi.xm.com.co/hourly"
+        # XM a veces no tiene datos de "hoy" hasta muy tarde. 
+        # Consultamos los últimos 3 días para asegurar que traiga algo.
+        end_date = datetime.datetime.now().date()
+        start_date = end_date - datetime.timedelta(days=3)
         
+        url = "https://servapibi.xm.com.co/hourly"
         payload = {
-            "MetricId": "DemandaReal",
-            "StartDate": str(ayer),
-            "EndDate": str(hoy),
+            "MetricId": metric,
+            "StartDate": str(start_date),
+            "EndDate": str(end_date),
             "Entity": "Sistema"
         }
+        headers = {
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0' # Engañar al servidor para que no crea que es un bot simple
+        }
+
+        print(f"--- Intentando MetricId: {metric} ---")
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
         
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code != 200: return None
+        # LOGS PARA RENDER (Ver en la consola de Render)
+        print(f"Status Code: {response.status_code}")
         
-        items = response.json().get('Items', [])
-        if not items: return None
+        if response.status_code != 200:
+            print(f"Error de XM: {response.text}")
+            return None, f"Error API XM: Código {response.status_code}"
+
+        data = response.json()
+        items = data.get('Items', [])
+
+        if not items:
+            print(f"Aviso: La métrica {metric} respondió 200 pero no trajo datos (lista vacía).")
+            return None, f"Variable {metric} sin datos en este rango de fechas."
 
         recs = []
         for item in items:
@@ -60,43 +62,36 @@ def fetch_xm_data():
                     ts = pd.to_datetime(d) + pd.to_timedelta(h-1, unit='h')
                     recs.append({'Timestamp': ts, 'MW': val})
         
-        return pd.DataFrame(recs).sort_values('Timestamp')
-    except Exception as e:
-        print(f"Error API: {e}")
-        return None
+        df = pd.DataFrame(recs).sort_values('Timestamp')
+        print(f"Éxito: {len(df)} registros recuperados.")
+        return df, "OK"
 
-# 4. Callback para actualizar la gráfica
+    except Exception as e:
+        print(f"Error crítico en la petición: {str(e)}")
+        return None, str(e)
+
 @app.callback(
     [Output('live-graph-demanda', 'figure'),
-     Output('live-update-text', 'children')],
+     Output('debug-status', 'children')],
     [Input('interval-component', 'n_intervals')]
 )
 def update_graph(n):
-    df = fetch_xm_data()
+    # Intento 1: Demanda Real
+    df, msg = fetch_xm_data("DemandaReal")
     
-    if df is None or df.empty:
-        return go.Figure(), "Error de conexión con XM. Reintentando..."
+    # Intento 2 (Fallback): Generación Real (si la demanda falla)
+    if df is None:
+        print("Reintentando con métrica alternativa: GeneracionReal")
+        df, msg = fetch_xm_data("GeneracionReal")
+    
+    if df is None:
+        return go.Figure(), f"FALLO TOTAL: {msg}. Revisa los Logs de Render."
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df['Timestamp'], y=df['MW'],
-        mode='lines+markers',
-        line=dict(color='#007bff', width=2),
-        fill='tozeroy',
-        fillcolor='rgba(0, 123, 255, 0.1)',
-        name='Demanda Real'
-    ))
-
-    fig.update_layout(
-        margin=dict(l=20, r=20, t=20, b=20),
-        xaxis=dict(showgrid=True, gridcolor='#eee'),
-        yaxis=dict(title="Megavatios (MW)", showgrid=True, gridcolor='#eee'),
-        plot_bgcolor='white',
-        hovermode="x unified"
-    )
-
-    status = f"Última actualización: {datetime.datetime.now().strftime('%H:%M:%S')}"
-    return fig, status
+    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['MW'], name='Valor Real'))
+    fig.update_layout(title=f"Datos recuperados ({datetime.datetime.now().strftime('%H:%M')})", plot_bgcolor='white')
+    
+    return fig, f"Conectado. Mostrando datos de: {msg if msg != 'OK' else 'Demanda Real'}"
 
 if __name__ == '__main__':
     app.run_server(debug=False)
