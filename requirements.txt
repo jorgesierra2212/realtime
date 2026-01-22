@@ -2,5 +2,5 @@ dash
 pandas
 plotly
 requests
-beautifulsoup4
+playwright
 gunicorn
