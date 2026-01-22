@@ -4,115 +4,122 @@ import plotly.graph_objs as go
 import pandas as pd
 import datetime
 import requests
+import re
+from bs4 import BeautifulSoup
 import json
 
 app = dash.Dash(__name__)
 server = app.server 
-app.title = "XM | Monitor Tiempo Real"
 
-# --- DISEÑO ---
-app.layout = html.Div(style={'backgroundColor': '#0b0f19', 'minHeight': '100vh', 'color': 'white', 'padding': '20px'}, children=[
-    html.Div(style={'maxWidth': '1100px', 'margin': '0 auto'}, children=[
-        html.H2("DEMANDA SIN COLOMBIA - TIEMPO REAL (5 MIN)", style={'color': '#38bdf8', 'textAlign': 'center', 'margin': '0'}),
-        html.P(id='debug-info', style={'textAlign': 'center', 'fontSize': '12px', 'color': '#94a3b8', 'marginBottom': '20px'}),
+# --- INTERFAZ DE SALA DE CONTROL ---
+app.layout = html.Div(style={'backgroundColor': '#020617', 'minHeight': '100vh', 'color': 'white', 'fontFamily': 'monospace'}, children=[
+    html.Div(style={'maxWidth': '1200px', 'margin': '0 auto', 'padding': '20px'}, children=[
+        html.Div(style={'borderLeft': '4px solid #38bdf8', 'paddingLeft': '15px', 'marginBottom': '30px'}, children=[
+            html.H1("MONITOR DE DEMANDA - SIN COLOMBIA", style={'margin': '0', 'fontSize': '22px', 'letterSpacing': '2px'}),
+            html.P("EXTRACCIÓN DE ALTA RESOLUCIÓN (Sinergox RT)", style={'color': '#38bdf8', 'margin': '5px 0 0 0'})
+        ]),
         
         dcc.Loading(children=dcc.Graph(id='rt-graph', config={'displayModeBar': False})),
         
-        html.Div(style={'display': 'flex', 'justifyContent': 'space-around', 'marginTop': '20px', 'backgroundColor': '#111827', 'padding': '20px', 'borderRadius': '10px'}, children=[
-            html.Div([html.P("REAL", style={'color': '#94a3b8', 'margin': '0'}), html.H2(id='val-real', style={'color': '#f8fafc'})]),
-            html.Div([html.P("PROGRAMADA", style={'color': '#94a3b8', 'margin': '0'}), html.H2(id='val-prog', style={'color': '#64748b'})])
+        html.Div(style={'display': 'flex', 'gap': '20px', 'marginTop': '20px'}, children=[
+            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '8px'}, children=[
+                html.P("ÚLTIMA LECTURA REAL", style={'color': '#94a3b8', 'fontSize': '12px'}),
+                html.H2(id='val-real', style={'color': '#f8fafc', 'margin': '0'})
+            ]),
+            html.Div(style={'flex': '1', 'backgroundColor': '#0f172a', 'padding': '20px', 'borderRadius': '8px'}, children=[
+                html.P("STATUS DEL SCRAPER", style={'color': '#94a3b8', 'fontSize': '12px'}),
+                html.H2(id='status-scrap', style={'fontSize': '18px', 'margin': '0'})
+            ])
         ]),
         
-        dcc.Interval(id='refresh', interval=120*1000, n_intervals=0)
+        dcc.Interval(id='refresh', interval=5*60*1000, n_intervals=0)
     ])
 ])
 
-def fetch_data():
-    # Rutas posibles para el servicio de tiempo real de XM
-    urls = [
-        "https://sinergox.xm.com.co/_vti_bin/XM.Sinergox.Servicios/Demanda.svc/GetDemandaRT",
-        "https://sinergox.xm.com.co/dmnd/Servicios/Demanda.svc/GetDemandaRT"
-    ]
-    
+# --- SCRAPER INTELIGENTE ---
+
+def scrape_sinergox():
+    url = "https://sinergox.xm.com.co/dmnd/Paginas/Informes/Demanda_Tiempo_Real.aspx"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Content-Type': 'application/json; charset=utf-8',
-        'X-Requested-With': 'XMLHttpRequest'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
+    
+    try:
+        session = requests.Session()
+        response = session.get(url, headers=headers, timeout=25)
+        
+        if response.status_code != 200:
+            return None, f"Error Acceso: {response.status_code}"
 
-    last_status = ""
-    for url in urls:
-        try:
-            # Enviamos POST con cuerpo {} como requiere el servicio .svc
-            response = requests.post(url, headers=headers, data="{}", timeout=15)
-            
-            if response.status_code == 200:
-                raw = response.json()
-                res = raw.get('GetDemandaRTResult', {})
-                
-                def parse_date(d):
-                    # Extraer milisegundos de /Date(123456789)/
-                    ms = int(d.split('(')[1].split(')')[0])
-                    return pd.to_datetime(ms, unit='ms') - pd.Timedelta(hours=5)
+        # Usamos BeautifulSoup para buscar los scripts
+        soup = BeautifulSoup(response.text, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        data_json = None
+        # Buscamos el script que contiene los datos de la gráfica
+        for script in scripts:
+            if script.string and 'dataReal' in script.string:
+                # Usamos Regex para extraer el contenido de la variable dataReal
+                # Buscamos algo como: var dataReal = [...];
+                match = re.search(r'var dataReal\s*=\s*(\[.*?\]);', script.string, re.DOTALL)
+                if match:
+                    data_json = match.group(1)
+                    break
+        
+        if not data_json:
+            return None, "No se encontró la variable dataReal en el HTML"
 
-                df_real = pd.DataFrame(res.get('DemandaReal', []))
-                df_prog = pd.DataFrame(res.get('DemandaProgramada', []))
+        # Limpiar y parsear el JSON extraído
+        # Los JSON de XM suelen tener fechas en formato /Date(...)/
+        raw_list = json.loads(data_json)
+        
+        records = []
+        for item in raw_list:
+            # Extraer milisegundos de "/Date(1737482400000)/"
+            ms_str = re.search(r'\((\d+)\)', item['Fecha']).group(1)
+            ts = pd.to_datetime(int(ms_str), unit='ms') - pd.Timedelta(hours=5)
+            records.append({'fecha': ts, 'valor': item['Valor']})
+            
+        return pd.DataFrame(records).sort_values('fecha'), "CONECTADO"
 
-                if not df_real.empty:
-                    df_real['fecha'] = df_real['Fecha'].apply(parse_date)
-                    df_prog['fecha'] = df_prog['Fecha'].apply(parse_date) if not df_prog.empty else None
-                    return df_real, df_prog, "OK"
-            
-            last_status = f"Status {response.status_code} en {url.split('/')[-3]}"
-        except Exception as e:
-            last_status = f"Error: {str(e)}"
-            
-    return None, None, last_status
+    except Exception as e:
+        return None, f"Fallo: {str(e)}"
+
+# --- CALLBACKS ---
 
 @app.callback(
-    [Output('rt-graph', 'figure'), Output('val-real', 'children'), 
-     Output('val-prog', 'children'), Output('debug-info', 'children')],
+    [Output('rt-graph', 'figure'), Output('val-real', 'children'), Output('status-scrap', 'children'), Output('status-scrap', 'style')],
     [Input('refresh', 'n_intervals')]
 )
-def update(n):
-    df_r, df_p, status = fetch_data()
+def update_dashboard(n):
+    df, status = scrape_sinergox()
     
-    if df_r is None or df_r.empty:
-        return go.Figure(), "---", "---", f"Intento de conexión: {status}"
+    if df is None or df.empty:
+        return go.Figure(), "---", status, {'color': '#ef4444'}
 
-    # Últimos valores
-    v_r = df_r['Valor'].iloc[-1]
-    # Buscar el valor programado para la misma hora que el real
-    v_p = df_p['Valor'].iloc[-1] if not df_p.empty else 0
-
+    v_actual = df['valor'].iloc[-1]
+    
+    # Crear gráfica estilizada
     fig = go.Figure()
-    
-    # Capa Programada
-    if not df_p.empty:
-        fig.add_trace(go.Scatter(
-            x=df_p['fecha'], y=df_p['Valor'], 
-            name='Programada', line=dict(color='#475569', dash='dot', width=1)
-        ))
-    
-    # Capa Real
     fig.add_trace(go.Scatter(
-        x=df_r['fecha'], y=df_r['Valor'], 
-        name='Demanda Real', line=dict(color='#38bdf8', width=3),
-        fill='tozeroy', fillcolor='rgba(56, 189, 248, 0.05)'
+        x=df['fecha'], y=df['valor'],
+        mode='lines',
+        line=dict(color='#38bdf8', width=3),
+        fill='tozeroy',
+        fillcolor='rgba(56, 189, 248, 0.05)',
+        hovertemplate='%{y:.1f} MW<br>%{x|%H:%M}<extra></extra>'
     ))
 
     fig.update_layout(
         template='plotly_dark',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=40, r=0, t=10, b=0),
+        margin=dict(l=40, r=0, t=10, b=30),
         xaxis=dict(showgrid=True, gridcolor='#1e293b', tickformat='%H:%M'),
-        yaxis=dict(showgrid=True, gridcolor='#1e293b', title="MW"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        yaxis=dict(showgrid=True, gridcolor='#1e293b', zeroline=False),
     )
 
-    return fig, f"{v_r:,.0f} MW", f"{v_p:,.0f} MW", f"Servicio Activo | Refresco: {datetime.datetime.now().strftime('%H:%M:%S')}"
+    return fig, f"{v_actual:,.0f} MW", f"● {status}", {'color': '#22c55e'}
 
 if __name__ == '__main__':
     app.run_server(debug=False)
