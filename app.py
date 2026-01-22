@@ -6,18 +6,22 @@ import pandas as pd
 import datetime
 import requests
 
-# Configuración de la App
+# 1. Inicializar la App y el Servidor inmediatamente
 app = dash.Dash(__name__)
 server = app.server 
-app.title = "Demanda XM en Tiempo Real"
+app.title = "Demanda XM Colombia"
 
-# --- DISEÑO DEL DASHBOARD ---
-app.layout = html.Div(style={'fontFamily': 'Segoe UI, sans-serif', 'padding': '30px', 'backgroundColor': '#f4f7f6'}, children=[
-    html.Div(style={'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '10px', 'boxShadow': '0px 4px 10px rgba(0,0,0,0.1)'}, children=[
-        html.H1("Demanda de Energía Colombia (SIN)", style={'textAlign': 'center', 'color': '#1a2a6c', 'margin': '0'}),
-        html.P(id='live-update-text', style={'textAlign': 'center', 'color': '#555', 'fontSize': '14px'}),
+# 2. Definir el Layout PRIMERO (para que nunca sea None)
+app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'padding': '20px', 'backgroundColor': '#f8f9fa'}, children=[
+    html.Div(style={'maxWidth': '1000px', 'margin': '0 auto', 'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '10px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)'}, children=[
+        html.H2("Demanda de Energía en Tiempo Real (SIN)", style={'textAlign': 'center', 'color': '#2c3e50'}),
+        html.P(id='live-update-text', style={'textAlign': 'center', 'color': '#7f8c8d'}, children="Cargando datos desde XM..."),
         
-        dcc.Graph(id='live-graph-demanda', config={'displayModeBar': False}),
+        dcc.Graph(
+            id='live-graph-demanda', 
+            config={'displayModeBar': False},
+            figure=go.Figure() # Figura vacía inicial
+        ),
         
         dcc.Interval(
             id='interval-component',
@@ -27,16 +31,13 @@ app.layout = html.Div(style={'fontFamily': 'Segoe UI, sans-serif', 'padding': '3
     ])
 ])
 
-# --- FUNCIÓN PARA OBTENER DATOS DIRECTO DE LA API DE XM ---
+# 3. Función robusta para traer datos (Sin librerías externas)
 def fetch_xm_data():
     try:
         hoy = datetime.datetime.now().date()
         ayer = hoy - datetime.timedelta(days=1)
-        
-        # Endpoint oficial de XM para datos horarios
         url = "https://servapibi.xm.com.co/hourly"
         
-        # Cuerpo de la petición (exactamente lo que pide XM)
         payload = {
             "MetricId": "DemandaReal",
             "StartDate": str(ayer),
@@ -44,69 +45,58 @@ def fetch_xm_data():
             "Entity": "Sistema"
         }
         
-        headers = {'Content-Type': 'application/json'}
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code != 200: return None
         
-        if response.status_code != 200:
-            return None
-            
-        data = response.json()
-        items = data.get('Items', [])
-        
-        if not items:
-            return None
+        items = response.json().get('Items', [])
+        if not items: return None
 
-        # Procesar los datos de formato "ancho" a "largo"
-        all_records = []
+        recs = []
         for item in items:
-            fecha_str = item['Date']
-            # XM devuelve Hour01, Hour02... Hour24
+            d = item['Date']
             for h in range(1, 25):
-                hour_key = f'Hour{str(h).zfill(2)}'
-                valor = item.get(hour_key)
-                if valor is not None:
-                    # Crear el timestamp exacto
-                    ts = pd.to_datetime(fecha_str) + pd.to_timedelta(h-1, unit='h')
-                    all_records.append({'Timestamp': ts, 'Demanda': valor})
+                val = item.get(f'Hour{str(h).zfill(2)}')
+                if val is not None:
+                    ts = pd.to_datetime(d) + pd.to_timedelta(h-1, unit='h')
+                    recs.append({'Timestamp': ts, 'MW': val})
         
-        df = pd.DataFrame(all_records).sort_values('Timestamp')
-        return df
+        return pd.DataFrame(recs).sort_values('Timestamp')
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error API: {e}")
         return None
 
-# --- CALLBACK PARA ACTUALIZACIÓN ---
+# 4. Callback para actualizar la gráfica
 @app.callback(
     [Output('live-graph-demanda', 'figure'),
      Output('live-update-text', 'children')],
     [Input('interval-component', 'n_intervals')]
 )
-def update_graph_live(n):
+def update_graph(n):
     df = fetch_xm_data()
     
     if df is None or df.empty:
-        return go.Figure(), "Esperando datos de XM..."
+        return go.Figure(), "Error de conexión con XM. Reintentando..."
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df['Timestamp'], y=df['Demanda'],
-        mode='lines',
-        line=dict(color='#007bff', width=3),
+        x=df['Timestamp'], y=df['MW'],
+        mode='lines+markers',
+        line=dict(color='#007bff', width=2),
         fill='tozeroy',
         fillcolor='rgba(0, 123, 255, 0.1)',
-        name='Demanda (MW)'
+        name='Demanda Real'
     ))
 
     fig.update_layout(
-        xaxis=dict(gridcolor='#eee', title="Hora"),
-        yaxis=dict(gridcolor='#eee', title="MW"),
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis=dict(showgrid=True, gridcolor='#eee'),
+        yaxis=dict(title="Megavatios (MW)", showgrid=True, gridcolor='#eee'),
         plot_bgcolor='white',
-        margin=dict(l=0, r=0, t=20, b=0),
         hovermode="x unified"
     )
 
-    now = datetime.datetime.now().strftime("%I:%M %p")
-    return fig, f"Última lectura: {now} (Actualización automática cada 5 min)"
+    status = f"Última actualización: {datetime.datetime.now().strftime('%H:%M:%S')}"
+    return fig, status
 
 if __name__ == '__main__':
     app.run_server(debug=False)
