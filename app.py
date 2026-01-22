@@ -5,93 +5,92 @@ import plotly.graph_objs as go
 import pandas as pd
 import datetime
 import requests
-import json
 
 app = dash.Dash(__name__)
 server = app.server 
 
-app.layout = html.Div(style={'fontFamily': 'Arial', 'padding': '20px'}, children=[
-    html.H2("Monitor de Demanda XM - Diagnóstico", style={'textAlign': 'center'}),
-    html.Div(id='debug-status', style={'color': 'red', 'textAlign': 'center', 'marginBottom': '20px'}),
-    dcc.Graph(id='live-graph-demanda'),
-    dcc.Interval(id='interval-component', interval=60*1000, n_intervals=0) # Reintentar cada minuto
+app.layout = html.Div([
+    html.H2("Dashboard Demanda XM (Auto-Descubrimiento)", style={'textAlign': 'center'}),
+    html.Div(id='status-bar', style={'textAlign': 'center', 'padding': '10px', 'color': 'blue'}),
+    dcc.Graph(id='main-graph'),
+    dcc.Interval(id='refresh', interval=5*60*1000, n_intervals=0)
 ])
 
-def fetch_xm_data(metric="DemandaReal"):
+def discover_metrics():
+    """Consulta el catálogo oficial de XM para ver los nombres reales de las métricas"""
     try:
-        # XM a veces no tiene datos de "hoy" hasta muy tarde. 
-        # Consultamos los últimos 3 días para asegurar que traiga algo.
-        end_date = datetime.datetime.now().date()
-        start_date = end_date - datetime.timedelta(days=3)
-        
-        url = "https://servapibi.xm.com.co/hourly"
-        payload = {
-            "MetricId": metric,
-            "StartDate": str(start_date),
-            "EndDate": str(end_date),
-            "Entity": "Sistema"
-        }
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0' # Engañar al servidor para que no crea que es un bot simple
-        }
+        url = "https://servapibi.xm.com.co/lists"
+        payload = {"MetricId": "ListadoMetricas"}
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            metrics = res.json().get('Items', [])
+            # Buscamos cualquier métrica que hable de Demanda
+            demanda_metrics = [m['MetricId'] for m in metrics if 'Demanda' in str(m.get('MetricName', ''))]
+            print(f"🔎 CATÁLOGO XM ENCONTRADO: {demanda_metrics}")
+            return demanda_metrics
+        return []
+    except:
+        return []
 
-        print(f"--- Intentando MetricId: {metric} ---")
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        
-        # LOGS PARA RENDER (Ver en la consola de Render)
-        print(f"Status Code: {response.status_code}")
-        
-        if response.status_code != 200:
-            print(f"Error de XM: {response.text}")
-            return None, f"Error API XM: Código {response.status_code}"
+def get_xm_data():
+    # Paso 1: Intentar con los nombres técnicos cortos más probables
+    # Según el estándar XM BI: 'DemaReal' es Demanda Real, 'DemanComer' es Comercial
+    target_metrics = ["DemaReal", "DemanComer", "Dema"] 
+    
+    # Paso 2: Intentar descubrir si hay otros nombres en el catálogo
+    catalog = discover_metrics()
+    for m in catalog:
+        if m not in target_metrics: target_metrics.append(m)
 
-        data = response.json()
-        items = data.get('Items', [])
-
-        if not items:
-            print(f"Aviso: La métrica {metric} respondió 200 pero no trajo datos (lista vacía).")
-            return None, f"Variable {metric} sin datos en este rango de fechas."
-
-        recs = []
-        for item in items:
-            d = item['Date']
-            for h in range(1, 25):
-                val = item.get(f'Hour{str(h).zfill(2)}')
-                if val is not None:
-                    ts = pd.to_datetime(d) + pd.to_timedelta(h-1, unit='h')
-                    recs.append({'Timestamp': ts, 'MW': val})
-        
-        df = pd.DataFrame(recs).sort_values('Timestamp')
-        print(f"Éxito: {len(df)} registros recuperados.")
-        return df, "OK"
-
-    except Exception as e:
-        print(f"Error crítico en la petición: {str(e)}")
-        return None, str(e)
+    end_date = datetime.datetime.now().date()
+    start_date = end_date - datetime.timedelta(days=2)
+    
+    for metric in target_metrics:
+        try:
+            url = "https://servapibi.xm.com.co/hourly"
+            payload = {
+                "MetricId": metric,
+                "StartDate": str(start_date),
+                "EndDate": str(end_date),
+                "Entity": "Sistema"
+            }
+            print(f"🚀 Probando MetricId: {metric}...")
+            r = requests.post(url, json=payload, timeout=15)
+            
+            if r.status_code == 200:
+                items = r.json().get('Items', [])
+                if items:
+                    print(f"✅ ÉXITO con: {metric}")
+                    data = []
+                    for item in items:
+                        fecha = item['Date']
+                        for h in range(1, 25):
+                            v = item.get(f'Hour{str(h).zfill(2)}')
+                            if v is not None:
+                                ts = pd.to_datetime(fecha) + pd.to_timedelta(h-1, unit='h')
+                                data.append({'TS': ts, 'Val': v})
+                    return pd.DataFrame(data).sort_values('TS'), metric
+            else:
+                print(f"❌ {metric} falló con status {r.status_code}")
+        except Exception as e:
+            print(f"⚠ Error en {metric}: {e}")
+            
+    return None, None
 
 @app.callback(
-    [Output('live-graph-demanda', 'figure'),
-     Output('debug-status', 'children')],
-    [Input('interval-component', 'n_intervals')]
+    [Output('main-graph', 'figure'), Output('status-bar', 'children')],
+    [Input('refresh', 'n_intervals')]
 )
-def update_graph(n):
-    # Intento 1: Demanda Real
-    df, msg = fetch_xm_data("DemandaReal")
-    
-    # Intento 2 (Fallback): Generación Real (si la demanda falla)
-    if df is None:
-        print("Reintentando con métrica alternativa: GeneracionReal")
-        df, msg = fetch_xm_data("GeneracionReal")
+def update(n):
+    df, metric_name = get_xm_data()
     
     if df is None:
-        return go.Figure(), f"FALLO TOTAL: {msg}. Revisa los Logs de Render."
+        return go.Figure(), "❌ No se encontró la métrica en el catálogo de XM. Revisa logs."
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['MW'], name='Valor Real'))
-    fig.update_layout(title=f"Datos recuperados ({datetime.datetime.now().strftime('%H:%M')})", plot_bgcolor='white')
+    fig = go.Figure(go.Scatter(x=df['TS'], y=df['Val'], fill='tozeroy', line=dict(color='#00CC96')))
+    fig.update_layout(title=f"Demanda detectada vía: {metric_name}", plot_bgcolor='white')
     
-    return fig, f"Conectado. Mostrando datos de: {msg if msg != 'OK' else 'Demanda Real'}"
+    return fig, f"Actualizado: {datetime.datetime.now().strftime('%H:%M')} | Métrica: {metric_name}"
 
 if __name__ == '__main__':
     app.run_server(debug=False)
